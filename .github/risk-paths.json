@@ -1,0 +1,57 @@
+{
+  "_說明": "PR 改了哪些路徑 → 對應哪個風險等級。多條規則同時命中時取最高一級。完全沒命中的檔案預設 medium（不會被自動合併）。",
+  "_等級定義": {
+    "high": "2 位人工核准（含資深或資安窗口）",
+    "medium": "1 位人工核准",
+    "low": "0 位人工核准；CI + CodeRabbit 通過後自動合併"
+  },
+  "_如何改成你的專案": "把 high 換成你最怕出事的目錄（金流、權限、資料庫、基礎設施），low 換成不會影響執行的目錄（文件、測試、樣式）。不知道該放哪的，就留在預設 medium。",
+  "high": [
+    "src/payments/**",
+    "src/billing/**",
+    "src/auth/**",
+    "src/security/**",
+    "**/permissions/**",
+    "migrations/**",
+    "**/migrations/**",
+    "**/*.sql",
+    "infra/**",
+    "terraform/**",
+    "k8s/**",
+    ".github/workflows/**",
+    ".github/scripts/**",
+    ".github/CODEOWNERS",
+    ".github/risk-paths.json",
+    ".coderabbit.yaml",
+    ".ai-review/**",
+    "Dockerfile",
+    "docker-compose*.yml",
+    "**/*.pem",
+    "**/secrets/**"
+  ],
+  "medium": [
+    "src/**",
+    "api/**",
+    "apps/**",
+    "packages/**",
+    "services/**",
+    "config/**",
+    "tools/**",
+    "package.json",
+    "package-lock.json"
+  ],
+  "low": [
+    "docs/**",
+    "**/*.md",
+    "**/*.mdx",
+    "tests/**",
+    "**/*.test.js",
+    "**/*.test.mjs",
+    "**/*.spec.js",
+    "**/__tests__/**",
+    "**/*.css",
+    "**/*.scss",
+    "public/**",
+    "assets/**"
+  ]
+}

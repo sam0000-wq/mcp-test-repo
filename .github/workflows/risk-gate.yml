@@ -1,0 +1,226 @@
+# ---------------------------------------------------------------
+# 這支 workflow 是「誰需要簽核」的唯一判定者。
+#
+# 設計重點：分支保護不要勾 Require approvals（勾了會連低風險也卡住），
+# 改成把 risk-gate 設為 required status check，由它依風險等級決定：
+#   low    → 0 位人工核准，並開啟自動合併
+#   medium → 1 位人工核准
+#   high   → 2 位人工核准
+#
+# 判定邏輯不寫在這裡，一律呼叫 .github/scripts/gate-check.mjs，
+# 與本地 `npm run verify` 用的是同一支腳本（本地測過＝線上行為）。
+#
+# 上線第一週請保持 DRY_RUN = "true"（只貼留言不合併），確認誤判率後再改 false。
+# 目前 = "true"：觀察期內只記錄判定，不會自動合併。
+# 注意：GitHub Free 的 private repo 開不了平台的 auto-merge，
+# 所以下面準備了兩條路（先試平台、不給就用管線自己合併）。
+# ---------------------------------------------------------------
+name: Risk Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+  merge_group:
+
+permissions:
+  contents: write # 低風險自動合併需要寫入權（沒有分支保護時，合併動作由這支 workflow 自己執行）
+  pull-requests: write
+  checks: read # auto-merge 前要用 REST 讀 ci-ok 的結果
+  issues: write # 合併後把紀錄寫進 PR 留言
+
+concurrency:
+  group: risk-gate-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DRY_RUN: "true" # 觀察期：low 風險只留言，不實際合併
+
+jobs:
+  classify:
+    if: github.event_name != 'merge_group'
+    name: risk-classify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      risk: ${{ steps.level.outputs.risk }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取得這個 PR 變更了哪些檔案
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh api "repos/$REPO/pulls/$NUM/files" --paginate --slurp > artifacts/raw-files.json
+          echo "變更檔案數：$(jq 'add | length' artifacts/raw-files.json)"
+          jq -r 'add[] | "  \(.status)  \(.filename)"' artifacts/raw-files.json
+
+      - name: 判定風險等級
+        id: level
+        run: |
+          set -euo pipefail
+          node .github/scripts/gate-check.mjs classify \
+            --files-json artifacts/raw-files.json \
+            --out artifacts/classify.json
+          RISK=$(node -e "console.log(JSON.parse(require('fs').readFileSync('artifacts/classify.json','utf8')).risk)")
+          echo "risk=$RISK" >> "$GITHUB_OUTPUT"
+
+      - name: 上傳判定紀錄
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-classify-${{ github.event.pull_request.number }}
+          path: artifacts/
+          retention-days: 14
+
+  risk-gate:
+    name: risk-gate
+    needs: [classify]
+    if: always() && (github.event_name == 'merge_group' || needs.classify.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Merge Queue 內直接放行
+        if: github.event_name == 'merge_group'
+        run: echo "核准數已在 PR 階段檢查完畢，佇列裡只重跑 CI"
+
+      - name: 取得 review 狀態並檢查門檻
+        if: github.event_name != 'merge_group'
+        uses: actions/checkout@v4
+
+      - name: 檢查合併門檻
+        if: github.event_name != 'merge_group'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          RISK: ${{ needs.classify.outputs.risk }}
+          DRY: ${{ env.DRY_RUN }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh api "repos/$REPO/pulls/$NUM/reviews" --paginate --slurp > artifacts/raw-reviews.json
+          ARGS=""
+          if [ "$DRY" = "true" ]; then ARGS="--dry-run"; fi
+          node .github/scripts/gate-check.mjs decide \
+            --risk "$RISK" \
+            --reviews artifacts/raw-reviews.json \
+            --author "$AUTHOR" \
+            --out artifacts/gate.json $ARGS
+
+      - name: 上傳門檻判定紀錄
+        if: always() && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-gate-${{ github.event.pull_request.number }}
+          path: artifacts/
+          retention-days: 14
+
+  auto-merge:
+    name: auto-merge
+    # 必須等 risk-gate 也過：只看 classify 就合併的話，萬一門檻判定有問題
+    # （或這個 repo 根本沒有 branch protection，比如 GitHub Free 的 private repo），
+    # 沒過審的程式碼會直接進主幹。
+    needs: [classify, risk-gate]
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.classify.outputs.risk == 'low' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # 裡面有一步是等 CI（最多 10 分鐘），不能再用預設 5 分鐘
+    steps:
+      - name: 等 CI 變綠（沒有 branch protection 時這是唯一防線）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # 為什麼要自己等：auto-merge 的「等檢查綠燈」是靠分支保護做到的。
+          # GitHub Free 的 private repo 建不了分支保護，於是 low 風險 + CI 紅也會被併進去。
+          # 有分支保護時這段只是多一道確認，不會誤傷。
+          #
+          # 兩個線上踩過的坑：
+          #   1. 不能用 gh pr view --json statusCheckRollup：它底層走 GraphQL，
+          #      Actions 的 GITHUB_TOKEN 無權讀（Resource not accessible by integration）。
+          #   2. 不能看「所有 check」：Risk Gate 自己的 job 也在裡面，會自己等自己死鎖。
+          #      所以只盯分支保護要選的那一個彙總檢查：ci-ok。
+          mkdir -p artifacts
+          DEADLINE=$((SECONDS + 600))
+          while :; do
+            gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" > artifacts/checks.json
+            STATE=$(node -e '
+              const raw = JSON.parse(require("fs").readFileSync("artifacts/checks.json", "utf8"));
+              const mine = (raw.check_runs || []).filter((c) => c.name === "ci-ok");
+              if (!mine.length) { console.log("WAIT 還沒看到 ci-ok"); }
+              else if (mine.some((c) => c.status !== "completed")) { console.log("WAIT ci-ok 進行中"); }
+              else if (mine.some((c) => c.conclusion !== "success")) { console.log("BAD " + mine.map((c) => c.conclusion).join(",")); }
+              else { console.log("GREEN ci-ok success"); }
+            ')
+            echo "$STATE"
+            case "$STATE" in
+              GREEN*) exit 0 ;;
+              BAD*) echo "::error::CI（ci-ok）未通過：${STATE#BAD }，不放行自動合併"; exit 1 ;;
+            esac
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::等 ci-ok 超過 10 分鐘，不自動合併"
+              exit 1
+            fi
+            sleep 20
+          done
+
+      - name: 低風險 → 真的合併（平台不給就自己合併）
+        env:
+          # 有存 MERGE_TOKEN 就優先用它執行合併：用 GITHUB_TOKEN 合併進主幹時，
+          # GitHub 會刻意不再觸發新 workflow（防止自我迴圈），於是主幹上看不到 CI。
+          # 換成個人 token 合併，主幹的驗證管線才會正常再跑一次。
+          GH_TOKEN: ${{ secrets.MERGE_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+          DRY: ${{ env.DRY_RUN }}
+        run: |
+          set -uo pipefail
+          # 一定要帶 --repo：這個 job 沒有 checkout，gh 找不到 git 上下文會直接失敗
+          # （線上實測抓到的錯：failed to run git: fatal: not a git repository）
+          if [ "$DRY" = "true" ]; then
+            gh pr comment "$NUM" --repo "$REPO" --body "【Risk Gate】風險等級 low，已通過門檻檢查，符合免人工合併條件。目前為觀察模式（DRY_RUN=true），未實際合併。"
+            echo "DRY_RUN 模式，僅留言"
+            exit 0
+          fi
+
+          mkdir -p artifacts
+          # 路徑一：平台自己的 auto-merge（有分支保護 / Pro 時最正確，會等全部檢查綠了才合併）
+          if gh pr merge "$NUM" --repo "$REPO" --auto --squash 2> artifacts/merge-err.txt; then
+            echo "已排入平台 auto-merge，CI 全綠後 GitHub 會自行合併"
+            exit 0
+          fi
+          ERR=$(cat artifacts/merge-err.txt || true)
+          echo "平台 auto-merge 不可用：${ERR}"
+          case "$ERR" in
+            *"not allowed"* | *"Pro"* | *"public"*) echo "GitHub 方案的限制（Free + private），改用下面路徑二" ;;
+            *) echo "::error::不如預期，不自動合併；請查這個錯誤：${ERR}"; exit 1 ;;
+          esac
+
+          # 路徑二：沒有分支保護可擋，而 CI 在上面那步已確認全綠 → 管線自己執行合併。
+          # 不加 --delete-branch：gh 在「合併成功但分支刪除失敗」時會回非零，
+          # 那樣會讓一個其實已合併的 PR 顯示成紅燈（假性失敗）。
+          for attempt in 1 2 3; do
+            if gh pr merge "$NUM" --repo "$REPO" --squash 2> artifacts/merge-err.txt; then
+              echo "OK 已由 Risk Gate 自行合併（第 ${attempt} 次嘗試）"
+              gh pr comment "$NUM" --repo "$REPO" --body "【Risk Gate】風險 low、ci-ok 全綠、門檻 0 位人工核准 → 已自動 squash 合併。（這個 repo 沒有分支保護，所以合併動作由管線自己執行，不是 GitHub 的 auto-merge）" || true
+              gh api -X DELETE "repos/$REPO/git/refs/heads/${{ github.event.pull_request.head.ref }}" || echo "（分支手動刪除失敗，不影響合併結果）"
+              exit 0
+            fi
+            echo "第 ${attempt} 次合併失敗：$(cat artifacts/merge-err.txt)"
+            sleep 15
+          done
+          echo "::error::重試 3 次仍無法合併，留在 PR 等人工處理"
+          exit 1

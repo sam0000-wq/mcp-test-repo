@@ -1,0 +1,23 @@
+{
+  "name": "ai-review-demo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AI 時代程式碼審核架構：可直接運行的範例專案",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "lint": "node tools/lint.mjs",
+    "test": "node --test",
+    "build": "node tools/build.mjs",
+    "check-yaml": "node .github/scripts/check-yaml.mjs",
+    "stats": "node .github/scripts/weekly-review-stats.mjs --demo --out artifacts/review-stats.json --md artifacts/review-stats.md --html artifacts/report/review-stats.html",
+    "selftest": "node .github/scripts/gate-check.mjs selftest",
+    "verify": "node .github/scripts/verify-all.mjs",
+    "setup": "node .github/scripts/gh-bootstrap.mjs open-setup-issue --repo"
+  },
+  "devDependencies": {
+    "js-yaml": "^4.1.0"
+  }
+}

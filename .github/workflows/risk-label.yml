@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------
+# 把 risk-classify 的判定結果貼成 PR 標籤：risk:low / risk:medium / risk:high
+# 目的：讓人在 PR 列表一眼看到風險，不用點進去；也讓「誰被叫來審核」變成可統計的資料。
+#
+# 判定邏輯不在這裡，仍呼叫 gate-check.mjs（與門檻判定共用同一份規則）。
+# 這支 workflow 只貼標籤與提醒，不影響合併與否（合併門檻由 risk-gate.yml 決定）。
+# ---------------------------------------------------------------
+name: Risk Label
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: risk-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: risk-label
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取得變更檔案並判定風險
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        id: risk
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh api "repos/$REPO/pulls/$NUM/files" --paginate --slurp > artifacts/raw-files.json
+          node .github/scripts/gate-check.mjs classify \
+            --files-json artifacts/raw-files.json \
+            --out artifacts/classify.json --quiet
+          RISK=$(node -e "console.log(JSON.parse(require('fs').readFileSync('artifacts/classify.json','utf8')).risk)")
+          echo "risk=$RISK" >> "$GITHUB_OUTPUT"
+          echo "判定結果：$RISK"
+
+      - name: 建立標籤（已存在就略過）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # 顏色：low 綠、medium 黃、high 紅
+          gh api -X POST "repos/$REPO/labels" -f name="risk:low"    -f color="0e8a16" -f description="免人工核准：CI 與 CodeRabbit 通過即自動合併" >/dev/null 2>&1 || true
+          gh api -X POST "repos/$REPO/labels" -f name="risk:medium" -f color="d93f0b" -f description="需 1 位人工核准"                          >/dev/null 2>&1 || true
+          gh api -X POST "repos/$REPO/labels" -f name="risk:high"   -f color="b60205" -f description="需 2 位人工核准（含資深或資安窗口）"      >/dev/null 2>&1 || true
+          echo "標籤就緒"
+
+      - name: 換上本次標籤（先移除舊的，避免同一 PR 出現三個等級）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+          RISK: ${{ steps.risk.outputs.risk }}
+        run: |
+          set -euo pipefail
+          gh pr edit "$NUM" --repo "$REPO" --remove-label "risk:low" --remove-label "risk:medium" --remove-label "risk:high" 2>/dev/null || true
+          gh pr edit "$NUM" --repo "$REPO" --add-label "risk:$RISK"
+
+      - name: 高風險補一次提醒（同一 PR 只貼一篇）
+        if: steps.risk.outputs.risk == 'high'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          MARKER="<!-- risk-label-notice -->"
+          if gh api "repos/$REPO/issues/$NUM/comments" --paginate -q '.[].body' | grep -q "risk-label-notice"; then
+            echo "已提醒過，跳過"
+            exit 0
+          fi
+          {
+            echo "$MARKER"
+            echo "### 這個 PR 被判定為高風險"
+            echo ""
+            echo "- 需要 **2 位**人工核准才能合併（由 Risk Gate 檢查，不是自願）"
+            echo "- 請確認：回滾方式、是否有 feature flag、受影響的客戶範圍"
+            echo "- 明細見本頁 Checks 的 \`risk-classify\` 工作，或 Artifacts 裡的 \`risk-classify-$NUM\`"
+          } | gh pr comment "$NUM" --repo "$REPO" --body-file -
+
+      - name: 上傳判定紀錄
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-label-${{ github.event.pull_request.number }}
+          path: artifacts/
+          retention-days: 14

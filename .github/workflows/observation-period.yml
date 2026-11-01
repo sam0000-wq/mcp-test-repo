@@ -1,0 +1,195 @@
+# ---------------------------------------------------------------
+# 一週觀察期結束提醒 workflow
+#
+# 運作方式：
+#   - 每週一 02:30 UTC（台北 10:30，比 weekly-review-stats 晚 30 分鐘讓統計先跑完）
+#   - 讀取本週統計結果，如果誤報率 < 30%，自動開一張「觀察期通過」issue
+#   - 如果誤報率 >= 30%，開「規則需收斂」issue（與 weekly-review-stats 不衝突，角色不同）
+#
+# 這支 workflow 不直接改 risk-gate.yml（改檔案需要 PR，這樣才有版本紀錄）。
+# 它的工作是：產出結論 → 開 issue 通知人 → 人確認後合併那個 PR。
+#
+# 注意：DRY_RUN 在觀察期維持 "true"；品質達標後才可啟用低風險自動合併。
+# 這支 workflow 是為了讓「安裝 CodeRabbit 後的第一週觀察期」有一個正式的結案節點。
+# ---------------------------------------------------------------
+name: Observation Period Check
+
+on:
+  schedule:
+    - cron: "30 2 * * 1" # 每週一 02:30 UTC（比 weekly-review-stats 晚 30 分鐘）
+  workflow_dispatch:
+    inputs:
+      force_conclude:
+        description: "強制產出結論（忽略樣本不足）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  conclude:
+    name: observation-period-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: 安裝相依
+        run: npm ci
+
+      - name: 產出本週統計（與 weekly-review-stats 邏輯相同）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/report
+          node .github/scripts/weekly-review-stats.mjs --fetch --repo "$REPO" --days 7 \
+            --out artifacts/review-stats.json \
+            --md artifacts/review-stats.md \
+            --html artifacts/report/review-stats.html
+
+      - name: 評估是否通過觀察期
+        id: eval
+        env:
+          FORCE: ${{ github.event.inputs.force_conclude || 'false' }}
+        run: |
+          set -euo pipefail
+          node -e "
+            const s = JSON.parse(require('fs').readFileSync('artifacts/review-stats.json','utf8'));
+            const fp = s.rates['誤報率'] ?? 0;
+            const total = s.window?.total ?? 0;
+            const force = process.env.FORCE === 'true';
+
+            console.log('fp_rate=' + fp);
+            console.log('total_comments=' + total);
+
+            if (!force && total < 5) {
+              console.log('verdict=insufficient_data');
+              console.log('reason=樣本不足（僅 ' + total + ' 條意見），繼續觀察');
+            } else if (fp < 30) {
+              console.log('verdict=pass');
+              console.log('reason=誤報率 ' + fp + '% < 30%，觀察期通過');
+            } else {
+              console.log('verdict=needs_tuning');
+              console.log('reason=誤報率 ' + fp + '% >= 30%，規則需要收斂');
+            }
+          " >> "$GITHUB_OUTPUT"
+
+      - name: 顯示評估結果到 Summary
+        run: |
+          {
+            echo "### 觀察期評估結果"
+            echo ""
+            echo "- 判定：\`${{ steps.eval.outputs.verdict }}\`"
+            echo "- 原因：${{ steps.eval.outputs.reason }}"
+            echo "- 本週 AI 意見總數：${{ steps.eval.outputs.total_comments }}"
+            echo "- 誤報率：${{ steps.eval.outputs.fp_rate }}%"
+            echo ""
+            cat artifacts/review-stats.md 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 觀察期通過 → 開 issue 通知負責人
+        if: steps.eval.outputs.verdict == 'pass'
+        env:
+          GH_TOKEN: ${{ secrets.MERGE_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          FP: ${{ steps.eval.outputs.fp_rate }}
+        run: |
+          set -euo pipefail
+          # 確認 DRY_RUN 的現值
+          CURRENT=$(grep 'DRY_RUN:' .github/workflows/risk-gate.yml | head -1 | grep -o '"[^"]*"' | head -1 || echo '"unknown"')
+          echo "risk-gate.yml 目前 DRY_RUN = $CURRENT"
+
+          # 只報告結果，不直接修改自動合併策略
+          TITLE="【觀察期通過】AI 審核誤報率 ${FP}%，低風險自動合併可正式啟用"
+          EXISTING=$(gh api "repos/$REPO/issues?state=open&per_page=50" \
+            -q ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          if [ -n "$EXISTING" ]; then
+            echo "issue 已存在 #$EXISTING，跳過"
+            exit 0
+          fi
+
+          gh issue create --repo "$REPO" \
+            --title "$TITLE" \
+            --label "setup" \
+            --body "## 觀察期通過 ✅
+
+          **本週 AI 審核意見品質達標：**
+          - 誤報率：**${FP}%**（門檻 < 30%）
+          - 意見總數：${{ steps.eval.outputs.total_comments }} 條
+
+          ### 目前狀態
+          \`risk-gate.yml\` 的 \`DRY_RUN\` 目前為 \`${CURRENT}\`。
+
+          $([ "$CURRENT" = '"false"' ] && echo '⚠️ **已是 false**，請確認這是經負責人審核後的設定。' || echo '✅ **仍為 true**；此 workflow 不會直接改動合併策略。')
+
+          ### 啟用方式
+          觀察期通過只代表統計門檻達標，不會自動修改合併設定。由 repo 負責人確認報告、審核下方高風險變更 PR 後，再啟用低風險自動合併。
+
+          ### 狀態確認
+          \`\`\`bash
+          # 確認 DRY_RUN 值
+          grep DRY_RUN .github/workflows/risk-gate.yml
+          \`\`\`
+
+          ### 需要啟用時
+          1. 編輯 \`.github/workflows/risk-gate.yml\`，把 \`DRY_RUN: \"true\"\` 改成 \`DRY_RUN: \"false\"\`
+          2. 提交 PR → Risk Gate 本身也是 CI required check，改這支 workflow 也需要過審
+          3. 合併後，下一個 risk:low 的 PR 就會真的被自動合併
+
+          ---
+          *由 Observation Period Check workflow 自動產出，詳細統計見本次執行的 Summary 頁面*"
+
+      - name: 規則需收斂 → 開 issue 提醒（與 weekly-review-stats 不重複）
+        if: steps.eval.outputs.verdict == 'needs_tuning'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          FP: ${{ steps.eval.outputs.fp_rate }}
+        run: |
+          set -euo pipefail
+          TITLE="【觀察期未通過】AI 審核誤報率 ${FP}%，需先收斂規則再啟用自動合併"
+          EXISTING=$(gh api "repos/$REPO/issues?state=open&per_page=50" \
+            -q ".[] | select(.title | startswith(\"【觀察期未通過】\")) | .number" | head -1)
+          if [ -n "$EXISTING" ]; then
+            echo "本週已有觀察期未通過 issue #$EXISTING，不重複開"
+            exit 0
+          fi
+          gh issue create --repo "$REPO" \
+            --title "$TITLE" \
+            --label "ai-review-quality" \
+            --body "## 觀察期尚未通過 ⚠️
+
+          本週誤報率 **${FP}%** 超過門檻（30%），請先收斂規則再正式啟用自動合併。
+
+          ### 建議步驟
+          1. 看本次 Observation Period Check 的 Summary，找出哪些目錄/規則誤報最多
+          2. 把誤報率 > 50% 的規則加到 \`.ai-review/rules.md\` 的忽略清單
+          3. 更新 \`.coderabbit.yaml\` 的 \`path_instructions\` 縮小範圍
+          4. 下週觀察期自動重新評估
+
+          ---
+          *由 Observation Period Check workflow 自動產出*"
+
+      - name: 樣本不足 → 僅在 Summary 顯示，不開 issue
+        if: steps.eval.outputs.verdict == 'insufficient_data'
+        run: echo "樣本不足，繼續觀察，不開 issue。"
+
+      - name: 上傳統計報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: observation-period-${{ github.run_id }}
+          retention-days: 90
+          path: |
+            artifacts/review-stats.json
+            artifacts/review-stats.md
+            artifacts/report/review-stats.html

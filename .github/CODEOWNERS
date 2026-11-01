@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------
+# CODEOWNERS 在這裡只做「通知與自動邀請審查者」，不是合併門檻。
+# 合併門檻一律由 Risk Gate（.github/risk-paths.json）判定。
+#
+# 已改成真實帳號：@sam0000-wq（這個 repo 的擁有者）。
+# 第二位簽核者：@johntest307（已接受 mcp-test-repo 的 write 邀請，2026-11-01）。
+# 加入其他人時，在同一行空一格貼上他的 handle，例如：
+#   /src/payments/              @sam0000-wq @teammate-handle
+# 注意：新 handle 必須是「已接受邀請的 repo 成員」，否則 GitHub 不會通知他。
+#
+# 方案提醒：GitHub Free 的 private repo 不會強制執行 CODEOWNERS
+# （require code owner review 是 Pro 的功能），這裡目前只保證「會通知到人」。
+# ---------------------------------------------------------------
+
+# 預設：所有檔案的變更都通知 repo 擁有者
+*                               @sam0000-wq
+
+# 中風險：一般業務邏輯
+/src/                           @sam0000-wq
+/api/                           @sam0000-wq
+/services/                      @sam0000-wq
+
+# 高風險：需要資深與資安窗口（Risk Gate 會另外要求 2 位不同的人工核准）
+/src/payments/                  @sam0000-wq @johntest307
+/src/billing/                   @sam0000-wq @johntest307
+/src/auth/                      @sam0000-wq @johntest307
+/src/security/                  @sam0000-wq @johntest307
+/migrations/                    @sam0000-wq @johntest307
+/infra/                         @sam0000-wq @johntest307
+/terraform/                     @sam0000-wq @johntest307
+/k8s/                           @sam0000-wq @johntest307
+
+# 審核管線本身：改規則就等於改標準，必須由平台負責人看過
+/.github/                       @sam0000-wq @johntest307
+/.coderabbit.yaml               @sam0000-wq @johntest307
+/.ai-review/                    @sam0000-wq @johntest307

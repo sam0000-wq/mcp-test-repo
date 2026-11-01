@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------
+# 所有 PR 的「機械檢查」。這一關過了，人才需要看邏輯。
+# 新增一關只要在 matrix.include 加一行，不用複製貼上整段 job。
+# 唯一需要設為 required 的檢查是 ci-ok；每一關的 log 都會上傳成 artifact。
+# ---------------------------------------------------------------
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group: # 進入 Merge Queue 後用這個事件再跑一次
+  workflow_dispatch:
+
+# 同一個 PR 只保留最新一次執行，省資源也省等待
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false # 一關失敗仍把其他關跑完，一次看到所有問題
+      matrix:
+        include:
+          - name: lint
+            cmd: npm run lint --if-present
+          - name: typecheck
+            cmd: npm run typecheck --if-present # 沒有這個 script 時自動跳過
+          - name: test
+            cmd: npm test --if-present
+          - name: build
+            cmd: npm run build --if-present
+          - name: security
+            cmd: npm audit --audit-level=high
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: 安裝相依（npm ci）
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          set -o pipefail
+          npm ci 2>&1 | tee ci-logs/${{ matrix.name }}-install.log
+
+      - name: 執行檢查
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          set -o pipefail
+          ${{ matrix.cmd }} 2>&1 | tee ci-logs/${{ matrix.name }}.log
+
+      - name: 上傳這一關的 log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-log-${{ matrix.name }}
+          path: ci-logs/
+          retention-days: 14
+
+  ci-ok:
+    name: ci-ok
+    needs: [check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 匯總結果
+        run: |
+          {
+            echo "### CI 匯總"
+            echo ""
+            echo "- 各關卡整體結果：\`${{ needs.check.result }}\`"
+            echo "- 明細請點左側 check 工作，或下方 Artifacts 的 ci-log-*"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.check.result }}" != "success" ]; then
+            echo "::error::有檢查未通過，阻斷合併"
+            exit 1
+          fi
+          echo "全部通過"

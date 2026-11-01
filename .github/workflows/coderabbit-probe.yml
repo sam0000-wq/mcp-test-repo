@@ -1,0 +1,199 @@
+# ---------------------------------------------------------------
+# 偵測 CodeRabbit GitHub App 是否已安裝並開始在這個 repo 留下意見。
+#
+# 觸發時機：
+#   1. 每 30 分鐘自動跑（*/30 * * * *），偵測到 bot 活躍後會把自己 disable，不再消耗分鐘數
+#   2. 手動執行（Actions → CodeRabbit Probe → Run workflow）
+#
+# 判定邏輯（兩個端點都掃，因為 CodeRabbit 初次在 repo 活躍時可能只發 review summary
+#   而沒有行內 comment）：
+#   A. pulls/comments（行內 inline comments）— since 7 天前
+#   B. pulls/{n}/reviews（review summary）— 掃最近 20 個 PR
+#   任一端點找到 coderabbitai[bot] 的記錄即判定「已活躍」。
+#
+#   已活躍 → 關閉 "CodeRabbit 尚未安裝" issue + 把自己 disable（停止 30 分鐘輪詢）
+#   未活躍 → 若沒有對應 issue 就開一張，避免重複開
+#
+# 為什麼 30 分鐘而非每天：
+#   安裝 App 後你通常馬上開一個測試 PR，希望幾分鐘內就確認，而不是等到隔天。
+#   偵測成功後 workflow 會自己把 schedule 停掉（disable），之後不再消耗資源。
+# ---------------------------------------------------------------
+name: CodeRabbit Probe
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # 每 30 分鐘，偵測到活躍後自動 disable
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 回溯幾天的 PR comments（行內意見端點）
+        required: false
+        default: "7"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: write  # 偵測到 bot 活躍後，把自己 disable 停止輪詢
+
+jobs:
+  probe:
+    name: coderabbit-probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ISSUE_TITLE: "【待辦】安裝 CodeRabbit GitHub App"
+    steps:
+      # ── Step 1：掃行內意見（pulls/comments）─────────────────────────────
+      - name: 掃 PR 行內意見（pulls/comments）
+        id: inline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DAYS: ${{ github.event.inputs.days || '7' }}
+        run: |
+          set -euo pipefail
+          SINCE=$(date -u -d "${DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+                  || date -u -v"-${DAYS}d" +"%Y-%m-%dT%H:%M:%SZ")
+          echo "掃行內意見（since $SINCE）..."
+          gh api "repos/$REPO/pulls/comments?since=$SINCE&per_page=100" \
+            --paginate > /tmp/inline.json 2>/dev/null || echo "[]" > /tmp/inline.json
+          COUNT=$(node -e "
+            const a = JSON.parse(require('fs').readFileSync('/tmp/inline.json','utf8'));
+            const arr = Array.isArray(a) ? a : [];
+            console.log(arr.filter(c => String(c.user?.login ?? '').toLowerCase().includes('coderabbit')).length);
+          ")
+          echo "行內意見 count=$COUNT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      # ── Step 2：掃 review summary（pulls/{n}/reviews）────────────────────
+      - name: 掃 PR review summary（最近 20 個 PR）
+        id: review
+        if: steps.inline.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "行內意見為 0，繼續掃 review summary..."
+          # 拿最近 20 個 PR（含 closed）
+          gh api "repos/$REPO/pulls?state=all&per_page=20" > /tmp/prs.json 2>/dev/null || echo "[]" > /tmp/prs.json
+          PR_NUMS=$(node -e "
+            const prs = JSON.parse(require('fs').readFileSync('/tmp/prs.json','utf8'));
+            console.log((Array.isArray(prs) ? prs : []).map(p => p.number).join(' '));
+          ")
+          REVIEW_COUNT=0
+          for N in $PR_NUMS; do
+            C=$(gh api "repos/$REPO/pulls/$N/reviews?per_page=50" 2>/dev/null \
+              | node -e "
+                  let d=''; process.stdin.on('data',c=>d+=c).on('end',()=>{
+                    try{ const a=JSON.parse(d);
+                      console.log((Array.isArray(a)?a:[]).filter(r=>String(r.user?.login??'').toLowerCase().includes('coderabbit')).length);
+                    }catch{console.log(0)}
+                  });" || echo 0)
+            REVIEW_COUNT=$((REVIEW_COUNT + C))
+            if [ "$REVIEW_COUNT" -gt 0 ]; then break; fi
+          done
+          echo "review summary count=$REVIEW_COUNT"
+          echo "count=$REVIEW_COUNT" >> "$GITHUB_OUTPUT"
+
+      # ── Step 3：彙總兩個端點的結果 ────────────────────────────────────────
+      - name: 彙總偵測結果
+        id: check
+        run: |
+          INLINE="${{ steps.inline.outputs.count }}"
+          REVIEW="${{ steps.review.outputs.count || '0' }}"
+          TOTAL=$((INLINE + REVIEW))
+          echo "行內=$INLINE  review=$REVIEW  合計=$TOTAL"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      # ── Step 4a：已活躍 ───────────────────────────────────────────────────
+      - name: CodeRabbit 已活躍 → 關閉待辦 issue
+        if: steps.check.outputs.total != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          INLINE: ${{ steps.inline.outputs.count }}
+          REVIEW: ${{ steps.review.outputs.count || '0' }}
+        run: |
+          set -euo pipefail
+          ISSUE_NUM=$(gh api "repos/$REPO/issues?state=open&per_page=50" \
+            -q ".[] | select(.title == \"${{ env.ISSUE_TITLE }}\") | .number" | head -1)
+          if [ -n "$ISSUE_NUM" ]; then
+            COMMENT_BODY=$(cat <<EOF
+          ✅ **CodeRabbit 已確認上線**
+          - 行內意見（pulls/comments）：${INLINE} 條
+          - Review summary（pulls/reviews）：${REVIEW} 條
+
+          接下來請觀察一週，Weekly Review Stats 與 Observation Period Check 會每週一自動評估品質。
+          DRY_RUN 目前維持 true；觀察期與品質門檻通過後才會啟用自動合併。
+          EOF
+            )
+            gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "$COMMENT_BODY"
+            gh issue close "$ISSUE_NUM" --repo "$REPO"
+            echo "已關閉 issue #$ISSUE_NUM"
+          else
+            echo "CodeRabbit 已活躍，沒有待辦 issue，無需操作。"
+          fi
+
+          {
+            echo "### ✅ CodeRabbit 已在線"
+            echo "- 行內意見：**${INLINE}** 條"
+            echo "- Review summary：**${REVIEW}** 條"
+            echo ""
+            echo "此 workflow 的定時排程即將被 disable，不再每 30 分鐘消耗資源。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 偵測成功 → disable 定時排程（停止 30 分鐘輪詢）
+        if: steps.check.outputs.total != '0' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # 取得這支 workflow 的 id
+          WF_ID=$(gh api "repos/$REPO/actions/workflows" \
+            -q '.workflows[] | select(.path == ".github/workflows/coderabbit-probe.yml") | .id')
+          if [ -n "$WF_ID" ]; then
+            gh api -X PUT "repos/$REPO/actions/workflows/$WF_ID/disable"
+            echo "已 disable workflow id=$WF_ID（coderabbit-probe），定時排程停止。"
+            echo "如需重新啟用：gh api -X PUT repos/$REPO/actions/workflows/$WF_ID/enable"
+          else
+            echo "找不到 workflow id，跳過 disable（手動關閉排程即可）。"
+          fi
+
+      # ── Step 4b：未活躍 ───────────────────────────────────────────────────
+      - name: CodeRabbit 尚未活躍 → 確保 issue 存在
+        if: steps.check.outputs.total == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(gh api "repos/$REPO/issues?state=open&per_page=50" \
+            -q ".[] | select(.title == \"${{ env.ISSUE_TITLE }}\") | .number" | head -1)
+          if [ -n "$EXISTING" ]; then
+            echo "待辦 issue #$EXISTING 已存在，無需重複開。"
+          else
+            BODY=$(cat .github/ISSUE_TEMPLATE/setup-coderabbit.md 2>/dev/null \
+                   | sed '/^---$/,/^---$/d' \
+                   || echo "請安裝 CodeRabbit GitHub App：https://github.com/apps/coderabbit-ai")
+            gh issue create --repo "$REPO" \
+              --title "${{ env.ISSUE_TITLE }}" \
+              --label "setup" \
+              --body "$BODY"
+            echo "已開 issue 提醒安裝 CodeRabbit"
+          fi
+
+          {
+            echo "### ⚠️ CodeRabbit 尚未偵測到任何記錄"
+            echo ""
+            echo "掃描範圍：最近 ${{ github.event.inputs.days || 7 }} 天行內意見 + 最近 20 個 PR 的 review summary"
+            echo ""
+            echo "可能原因："
+            echo "1. **App 尚未安裝** → [github.com/apps/coderabbit-ai](https://github.com/apps/coderabbit-ai)"
+            echo "2. App 已裝但 7 天內沒有新 PR → 開一個測試 PR，等 1–3 分鐘讓 CodeRabbit 跑"
+            echo "3. \`.coderabbit.yaml\` 的 \`auto_review.enabled: false\` → 確認設定"
+            echo ""
+            echo "下次自動掃描：約 30 分鐘後"
+          } >> "$GITHUB_STEP_SUMMARY"

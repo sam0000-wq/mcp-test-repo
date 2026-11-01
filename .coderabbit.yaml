@@ -1,0 +1,93 @@
+# ---------------------------------------------------------------
+# CodeRabbit 設定檔（放在 repo 根目錄）
+# 注意：CodeRabbit 的 schema 會隨版本調整，貼上後請用官方 config 驗證器跑一次，
+#       若有欄位不認得，刪掉該欄位即可，不影響其他設定生效。
+# 這份設定刻意調成「少而準」：寧可漏報，也不要讓工程師被噪音淹沒。
+# ---------------------------------------------------------------
+language: zh-TW
+
+reviews:
+  # chill = 只講重點、語氣收斂；assertive 會什麼都提，不建議初期使用
+  profile: chill
+
+  # 不要用「請求變更」卡住 PR，意見用留言表達即可（是否擋合併交給 risk-gate 與 CI）
+  request_changes_workflow: false
+
+  high_level_summary: true
+  review_status: true
+  poem: false
+  collapse_walkthrough: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    # 關鍵：只審「這次新增/修改的行」，避免每一輪都把舊帳重翻一次
+    auto_incremental_review: true
+    base_branches:
+      - main
+
+  # 不要浪費審核預算在這些檔案上
+  path_filters:
+    - "!**/package-lock.json"
+    - "!**/pnpm-lock.yaml"
+    - "!**/yarn.lock"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/*.min.js"
+    - "!**/*.generated.*"
+
+  path_instructions:
+    - path: "**"
+      instructions: |
+        請嚴格依照 .ai-review/rules.md 的規則審查，重點如下：
+        1. 只提出「會造成錯誤、資料異常、安全風險」的問題，以及明確可證的邏輯缺陷。
+        2. 不要提出排版、引號、分號、命名風格等意見，那些交給 linter。
+        3. 不要對「既有程式碼」的舊問題發言，只看本次 diff 新增或修改的部分。
+        4. 不要提出「可以考慮重構成…」這類沒有明確錯誤的建議。
+        5. 每一條意見都必須給出檔案:行號與具體改法，說不出改法的就不要提。
+
+    - path: "src/payments/**"
+      instructions: |
+        高風險路徑（金流）。除了一般規則，必須額外檢查：
+        - 金額計算是否使用浮點數（應為整數或定點數）
+        - 是否具備冪等性（重複請求會不會重複扣款）
+        - 是否記錄稽核 log
+        - 失敗時是否有明確的回滾或補償路徑
+
+    - path: "src/auth/**"
+      instructions: |
+        高風險路徑（認證授權）。必須額外檢查：
+        - 是否有未授權即可存取的入口
+        - 權限檢查是否在前端做（應在後端）
+        - token/session 的有效期與失效處理
+        - 是否有敏感資訊寫入 log
+
+    - path: "**/migrations/**"
+      instructions: |
+        資料庫變更。必須額外檢查：
+        - 是否有對應的回滾（down）腳本
+        - 大表變更是否會鎖表
+        - 是否為破壞性變更（刪欄位、改型別）
+        - 是否可以在不停機的情況下執行
+
+    - path: ".github/**"
+      instructions: |
+        這是審核管線本身。只檢查安全性問題（例如權限過大、注入風險、密鑰洩漏），
+        不要提出風格或結構建議。
+
+  tools:
+    # 密鑰外洩掃描一定要開
+    gitleaks:
+      enabled: true
+    # 風格類工具全部關掉，避免與 CI 的 linter 重複
+    markdownlint:
+      enabled: false
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - ".ai-review/rules.md"

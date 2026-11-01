@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------
+# 管線自己的迴歸測試：驗證「審核機制有沒有壞」。
+# 這支 workflow 不會擋任何人，但它是最快速的除錯入口——
+# 改完 risk-paths.json 或 gate-check.mjs，先看這裡有沒有變紅。
+#
+# 在哪看結果：GitHub → Actions → 這次執行 →
+#   1) Summary 頁面：全部項目的通過/失敗表格
+#   2) Summary 頁面下方 Artifacts → gate-report：內含 index.html（每步完整 log）
+# ---------------------------------------------------------------
+name: Pipeline Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # 可手動觸發
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: 管線自我驗證
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: 安裝相依
+        run: npm ci
+
+      - name: 跑全部實測（CI／風險分級／門檻／自動合併／端到端）
+        shell: bash
+        run: |
+          set -o pipefail
+          node .github/scripts/verify-all.mjs 2>&1 | tee verify-console.log
+
+      - name: 把結果表格顯示在 Summary 頁面
+        if: always()
+        shell: bash
+        run: |
+          node - <<'EOF'
+          const fs = require("fs");
+          const r = JSON.parse(fs.readFileSync("artifacts/results.json", "utf8"));
+          const lines = [
+            "### 管線自我驗證結果",
+            "",
+            `共 ${r.summary.total} 項，通過 ${r.summary.passed} 項，未通過 ${r.summary.failed.length} 項`,
+            "",
+            "| # | 組別 | 項目 | 結果 |",
+            "| --- | --- | --- | --- |",
+          ];
+          for (const x of r.results) lines.push(`| ${x.id} | ${x.group} | ${x.name} | ${x.ok ? "✅" : "❌"} |`);
+          if (r.summary.failed.length) lines.push("", "**未通過項目：** " + r.summary.failed.join("；"));
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          EOF
+
+      - name: 上傳報告與全部 log（Actions Summary → Artifacts 下載）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-report
+          retention-days: 30
+          path: |
+            artifacts/report
+            artifacts/logs
+            artifacts/results.json
+            artifacts/selftest.json
+            artifacts/review-stats.json
+            artifacts/review-stats.md
+            verify-console.log

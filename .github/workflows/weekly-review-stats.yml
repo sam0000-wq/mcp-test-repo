@@ -1,0 +1,92 @@
+# ---------------------------------------------------------------
+# 每週一 02:00 UTC（台北 10:00）統計上週 AI 審核意見的品質，把結果貼到 Actions Summary，
+# 誤報率超過門檻時自動開一張 issue，讓「調規則」這件事不需要有人記得去做。
+#
+# 也可手動觸發（Actions → Pipeline… → Weekly Review Stats → Run workflow），
+# 輸入 days 決定回溯幾天。
+# ---------------------------------------------------------------
+name: Weekly Review Stats
+
+on:
+  schedule:
+    - cron: "0 2 * * 1" # 每週一
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 回溯天數
+        required: false
+        default: "7"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  stats:
+    name: review-stats
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FP_ALERT: "30" # 誤報率超過這個百分比就開 issue
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: 安裝相依
+        run: npm ci
+
+      - name: 先跑統計邏輯的自我驗證
+        run: node .github/scripts/weekly-review-stats.mjs selftest
+
+      - name: 抓取上週意見與 PR 並統計
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DAYS: ${{ github.event.inputs.days || '7' }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/report
+          node .github/scripts/weekly-review-stats.mjs --fetch --repo "$REPO" --days "$DAYS" \
+            --out artifacts/review-stats.json \
+            --md artifacts/review-stats.md \
+            --html artifacts/report/review-stats.html
+
+      - name: 顯示在 Summary 頁面
+        if: always()
+        run: cat artifacts/review-stats.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 誤報率過高就開 issue（同一週只開一張）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          FP=$(node -e "console.log(JSON.parse(require('fs').readFileSync('artifacts/review-stats.json','utf8')).rates['誤報率'])")
+          echo "本週誤報率：$FP%（門檻 ${{ env.FP_ALERT }}%）"
+          if [ "$(echo "$FP > ${{ env.FP_ALERT }}" | bc -l)" != "1" ]; then
+            echo "在門檻內，不需開 issue"
+            exit 0
+          fi
+          TITLE="AI 審核誤報率 ${FP}%：需要收斂規則"
+          if gh api "repos/$REPO/issues" -f state=all -f per_page=50 -q '.[].title' | grep -q "$TITLE"; then
+            echo "本週已開過，跳過"
+            exit 0
+          fi
+          gh issue create --repo "$REPO" --title "$TITLE" --body-file artifacts/review-stats.md
+
+      - name: 上傳統計報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-stats
+          retention-days: 90
+          path: |
+            artifacts/review-stats.json
+            artifacts/review-stats.md
+            artifacts/report/review-stats.html
