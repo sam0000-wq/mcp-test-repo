@@ -11,8 +11,10 @@ export function charge({ orderId, amount, idempotencyKey, discountPercent = 0, s
   const existing = store.get(idempotencyKey);
   if (existing) return { ...existing, replayed: true };
 
+  // 折扣上限：避免負折扣或超過 100% 的折扣把金額算成負數
+  const capped = Math.min(Math.max(discountPercent, 0), 100);
   const gross = toCents(amount);
-  const cents = discountPercent > 0 ? Math.round(gross * (1 - discountPercent / 100)) : gross;
+  const cents = capped > 0 ? Math.round(gross * (1 - capped / 100)) : gross;
   if (!Number.isInteger(cents) || cents <= 0) {
     throw new Error(`扣款金額必須是正整數（單位：分），收到 ${cents}`);
   }
