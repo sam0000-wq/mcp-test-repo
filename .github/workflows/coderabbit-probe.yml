@@ -1,9 +1,13 @@
 # ---------------------------------------------------------------
 # 偵測 CodeRabbit GitHub App 是否已安裝並開始在這個 repo 留下意見。
 #
-# 觸發時機：
-#   1. 每 30 分鐘自動跑（*/30 * * * *），偵測到 bot 活躍後會把自己 disable，不再消耗分鐘數
-#   2. 手動執行（Actions → CodeRabbit Probe → Run workflow）
+# 觸發方式：手動執行（Actions → CodeRabbit Probe → Run workflow）。
+#
+# 為什麼沒有排程：
+#   原本是每 30 分鐘自動跑一次，但「偵測到活躍就把自己 disable」是單向開關——
+#   只有成功才會停，失敗不會停。App 沒裝就永遠偵測不到，變成無限輪詢。
+#   現在改成需要手動觸發，裝好 App 後跑一次確認即可。
+#   若之後要恢復自動化，cron 改成每天一次（不要 30 分鐘）。
 #
 # 判定邏輯（兩個端點都掃，因為 CodeRabbit 初次在 repo 活躍時可能只發 review summary
 #   而沒有行內 comment）：
@@ -11,18 +15,22 @@
 #   B. pulls/{n}/reviews（review summary）— 掃最近 20 個 PR
 #   任一端點找到 coderabbitai[bot] 的記錄即判定「已活躍」。
 #
-#   已活躍 → 關閉 "CodeRabbit 尚未安裝" issue + 把自己 disable（停止 30 分鐘輪詢）
+#   已活躍 → 關閉 "CodeRabbit 尚未安裝" issue
 #   未活躍 → 若沒有對應 issue 就開一張，避免重複開
-#
-# 為什麼 30 分鐘而非每天：
-#   安裝 App 後你通常馬上開一個測試 PR，希望幾分鐘內就確認，而不是等到隔天。
-#   偵測成功後 workflow 會自己把 schedule 停掉（disable），之後不再消耗資源。
 # ---------------------------------------------------------------
 name: CodeRabbit Probe
 
 on:
-  schedule:
-    - cron: "*/30 * * * *" # 每 30 分鐘，偵測到活躍後自動 disable
+  # 2026-11-01：已拿掉 schedule。
+  #
+  # 原本是 `*/30 * * * *`，但它的自我 disable 邏輯只在「偵測到 bot 活躍」時才觸發。
+  # CodeRabbit App 沒裝之前，永遠偵測不到 → 永遠不會 disable → 每 30 分鐘白燒一次。
+  # 這是個單向開關：只有成功才會停，失敗不會停。
+  #
+  # 現在改成只手動觸發：裝好 App 後跑一次確認在線即可。
+  # 若之後要恢復自動化，建議每天一次，不要 30 分鐘：
+  #   schedule:
+  #     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       days:
@@ -34,7 +42,9 @@ permissions:
   contents: read
   issues: write
   pull-requests: read
-  actions: write  # 偵測到 bot 活躍後，把自己 disable 停止輪詢
+  # 2026-11-01：拿掉 actions: write。
+  # 它只為了「偵測成功後 disable 自己的排程」而存在，那段邏輯已隨 schedule 一併移除。
+  # 依最小權限原則不再申請。
 
 jobs:
   probe:
@@ -141,26 +151,9 @@ jobs:
             echo "- 行內意見：**${INLINE}** 條"
             echo "- Review summary：**${REVIEW}** 條"
             echo ""
-            echo "此 workflow 的定時排程即將被 disable，不再每 30 分鐘消耗資源。"
+            echo "這支 workflow 沒有定時排程（2026-11-01 移除），不會再消耗額度。"
+            echo "之後要重新檢查，再到 Actions 手動執行一次即可。"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 偵測成功 → disable 定時排程（停止 30 分鐘輪詢）
-        if: steps.check.outputs.total != '0' && github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # 取得這支 workflow 的 id
-          WF_ID=$(gh api "repos/$REPO/actions/workflows" \
-            -q '.workflows[] | select(.path == ".github/workflows/coderabbit-probe.yml") | .id')
-          if [ -n "$WF_ID" ]; then
-            gh api -X PUT "repos/$REPO/actions/workflows/$WF_ID/disable"
-            echo "已 disable workflow id=$WF_ID（coderabbit-probe），定時排程停止。"
-            echo "如需重新啟用：gh api -X PUT repos/$REPO/actions/workflows/$WF_ID/enable"
-          else
-            echo "找不到 workflow id，跳過 disable（手動關閉排程即可）。"
-          fi
 
       # ── Step 4b：未活躍 ───────────────────────────────────────────────────
       - name: CodeRabbit 尚未活躍 → 確保 issue 存在
@@ -178,10 +171,26 @@ jobs:
             BODY=$(cat .github/ISSUE_TEMPLATE/setup-coderabbit.md 2>/dev/null \
                    | sed '/^---$/,/^---$/d' \
                    || echo "請安裝 CodeRabbit GitHub App：https://github.com/apps/coderabbit-ai")
-            gh issue create --repo "$REPO" \
-              --title "${{ env.ISSUE_TITLE }}" \
-              --label "setup" \
-              --body "$BODY"
+            # 先確保 label 存在：gh 的預設標籤清單沒有 "setup"，
+            # 直接 --label "setup" 會讓 gh issue create 失敗 → 這支 workflow
+            # 曾經在這一步就掛掉，待辦 issue 從來沒開出來過。
+            # --force 是冪等的：label 已存在時不會報錯。
+            gh label create "setup" --repo "$REPO" \
+              --description "環境與管線設定的待辦事項" \
+              --color 0E8A16 --force \
+              || echo "（建立 label 失敗，改用無 label 的方式開 issue）"
+            if gh label list --repo "$REPO" --json name \
+                 -q '.[].name' | grep -qx "setup"; then
+              gh issue create --repo "$REPO" \
+                --title "${{ env.ISSUE_TITLE }}" \
+                --label "setup" \
+                --body "$BODY"
+            else
+              # label 建不起來也不能讓 issue 開不出去：去掉 --label 重試一次
+              gh issue create --repo "$REPO" \
+                --title "${{ env.ISSUE_TITLE }}" \
+                --body "$BODY"
+            fi
             echo "已開 issue 提醒安裝 CodeRabbit"
           fi
 
@@ -195,5 +204,5 @@ jobs:
             echo "2. App 已裝但 7 天內沒有新 PR → 開一個測試 PR，等 1–3 分鐘讓 CodeRabbit 跑"
             echo "3. \`.coderabbit.yaml\` 的 \`auto_review.enabled: false\` → 確認設定"
             echo ""
-            echo "下次自動掃描：約 30 分鐘後"
+            echo "這支 workflow 沒有定時排程，需要再到 Actions 手動執行一次。"
           } >> "$GITHUB_STEP_SUMMARY"
